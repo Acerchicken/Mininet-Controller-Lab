@@ -47,18 +47,19 @@ The system requires two components running simultaneously: the Monitor Dashboard
 **Terminal 1: Start the Monitoring Dashboard (UDP Receiver)**
 
 This terminal will display live statistics.
-
+(Run in the folder that have the file)
 ```bash
 python monitor.py
-
+```
 
 **Terminal 2: Start the POX Controller**
-(Copy the prototype.py file into the /pox/pox/ext folder)
+(Copy the prototype.py file into the /pox/pox/ext folder and go back to /pox/pox to run command)
 ```bash
 cd pox
 ./pox.py openflow.discovery controller.py
-
+```
 **Terminal 3: Start mininet with pre-configured topo**
 (Run in the folder that have the file)
 ```bash
 sudo mn --custom multi_router_topo.py --topo mytopo --controller remote --mac
+```
