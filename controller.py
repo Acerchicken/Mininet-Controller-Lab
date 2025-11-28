@@ -12,6 +12,7 @@ from pox.openflow.discovery import Discovery
 import socket
 
 log = core.getLogger()
+import arp_handler, firewall, flow_installer, ip_handler
 
 # =============================================================================
 # 0. GLOBAL CONFIGURATION & STATE
