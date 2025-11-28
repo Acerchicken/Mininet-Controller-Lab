@@ -119,19 +119,213 @@ def get_next_hop_port(src_dpid, dst_dpid):
 # =============================================================================
 
 
+def send_arp_request_smart(target_ip):
+    """Gửi ARP Request unicast đến switch đích (Tránh Flood)"""
+    gw = find_gateway_for_ip(target_ip)
+    if not gw: return
+    target_dpid = gateway_ip_to_dpid.get(gw)
+    if not target_dpid or target_dpid not in connections: return
+
+    src_mac = router_interfaces[gw]
+    r = arp()
+    r.hwsrc = src_mac
+    r.hwdst = EthAddr("ff:ff:ff:ff:ff:ff")
+    r.opcode = arp.REQUEST
+    r.protosrc = IPAddr(gw)
+    r.protodst = IPAddr(target_ip)
+    e = ethernet(type=ethernet.ARP_TYPE, src=src_mac, dst=r.hwdst)
+    e.payload = r
+    
+    msg = of.ofp_packet_out()
+    msg.data = e.pack()
+    msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+    connections[target_dpid].send(msg)
+    log.info("Smart ARP: Router requesting %s on s%s" % (target_ip, target_dpid))
+
+def handle_arp_request(packet, packet_in, event):
+    """Xử lý ARP Request (Proxy ARP cho Gateway / Flood cho nội bộ)"""
+    arp_packet = packet.payload
+    target_ip = str(arp_packet.protodst)
+    source_ip = str(arp_packet.protosrc)
+    
+    learn_location(source_ip, event.dpid, packet_in.in_port)
+    arp_cache[source_ip] = arp_packet.hwsrc
+    
+    # CASE 1: ARP cho Gateway -> Router trả lời
+    if target_ip in router_interfaces:
+        reply_mac = router_interfaces[target_ip]
+        arp_reply = arp()
+        arp_reply.hwsrc = reply_mac
+        arp_reply.hwdst = arp_packet.hwsrc
+        arp_reply.opcode = arp.REPLY
+        arp_reply.protosrc = IPAddr(target_ip)
+        arp_reply.protodst = IPAddr(source_ip)
+        
+        ether = ethernet(type=ethernet.ARP_TYPE, src=reply_mac, dst=arp_packet.hwsrc)
+        ether.payload = arp_reply
+        
+        msg = of.ofp_packet_out()
+        msg.data = ether.pack()
+        msg.actions.append(of.ofp_action_output(port=packet_in.in_port))
+        event.connection.send(msg)
+        return
+
+    # CASE 2: ARP nội bộ (Host tìm Host) -> Flood trong subnet
+    gw = find_gateway_for_ip(target_ip)
+    if not gw: return
+    target_subnet_dpid = gateway_ip_to_dpid.get(gw)
+    
+    # Chặn ARP lan sang subnet khác
+    if event.dpid != target_subnet_dpid: return 
+
+    msg = of.ofp_packet_out()
+    msg.data = packet_in.data
+    msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+    event.connection.send(msg)
+
+def handle_arp_reply(packet, packet_in, event):
+    """Xử lý ARP Reply và Forward về host yêu cầu"""
+    arp_packet = packet.payload
+    src_ip = str(arp_packet.protosrc)
+    dst_ip = str(arp_packet.protodst)
+    
+    arp_cache[src_ip] = arp_packet.hwsrc
+    learn_location(src_ip, event.dpid, packet_in.in_port)
+    log.info("ARP Learned: %s -> %s" % (src_ip, arp_packet.hwsrc))
+    
+    # Xử lý hàng đợi
+    if src_ip in packet_queue:
+        for item in packet_queue[src_ip]:
+            handle_ip_packet(item['packet'], item['packet_in'], item['event'])
+        del packet_queue[src_ip]
+
+    if dst_ip in router_interfaces: return
+
+    # Forward ARP Reply về cho host
+    if dst_ip in ip_to_location:
+        (dst_dpid, dst_port) = ip_to_location[dst_ip]
+        if dst_dpid == event.dpid:
+            msg = of.ofp_packet_out()
+            msg.data = packet_in.data
+            msg.actions.append(of.ofp_action_output(port=dst_port))
+            event.connection.send(msg)
+            return
+
+    # Fallback flood nếu chưa biết vị trí
+    msg = of.ofp_packet_out()
+    msg.data = packet_in.data
+    msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+    event.connection.send(msg)
+
+
 # =============================================================================
 # 2. YÊU CẦU 3: FLOW INSTALLATION (flow_installer.py)
 # =============================================================================
+
+def install_route_flow(event, packet, src_ip, dst_ip, src_mac, dst_mac, out_port):
+    """
+    Cài đặt Flow L3 với Priority 50.
+    Match đầy đủ 5-tuple (Src IP, Dst IP, Proto) để hỗ trợ Monitor TX/RX.
+    """
+    fm = of.ofp_flow_mod()
+    fm.match.dl_type = ethernet.IP_TYPE
+    
+    # Match IP Header
+    fm.match.nw_src = IPAddr(src_ip) 
+    fm.match.nw_dst = IPAddr(dst_ip)
+    fm.match.nw_proto = packet.protocol # TCP/UDP/ICMP
+
+    fm.priority = 50
+    fm.idle_timeout = 100
+    
+    # Actions: Rewrite MAC & Output
+    fm.actions.append(of.ofp_action_dl_addr.set_src(src_mac))
+    fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
+    fm.actions.append(of.ofp_action_output(port=out_port))
+    
+    event.connection.send(fm)
 
 
 # =============================================================================
 # 3. YÊU CẦU 2: IP PACKET HANDLER (ip_handler.py)
 # =============================================================================
 
+def handle_ip_packet(packet, packet_in, event):
+    ip_packet = packet.payload
+    if not isinstance(ip_packet, ipv4): return
+    
+    src_ip = str(ip_packet.srcip)
+    dst_ip = str(ip_packet.dstip)
+    
+    learn_location(src_ip, event.dpid, packet_in.in_port)
+    
+    # 1. Ping Router Interface
+    if dst_ip in router_interfaces:
+        if ip_packet.protocol == IP_ICMP_PROTOCOL and ip_packet.payload.type == ICMP_ECHO_REQUEST:
+            icmp_req = ip_packet.payload
+            icmp_rep = icmp(type=ICMP_ECHO_REPLY, code=0, payload=icmp_req.payload)
+            ip_rep = ipv4(protocol=IP_ICMP_PROTOCOL, srcip=ip_packet.dstip, dstip=ip_packet.srcip, payload=icmp_rep)
+            eth_rep = ethernet(type=ethernet.IP_TYPE, src=packet.dst, dst=packet.src, payload=ip_rep)
+            msg = of.ofp_packet_out(data=eth_rep.pack())
+            msg.actions.append(of.ofp_action_output(port=packet_in.in_port))
+            event.connection.send(msg)
+        return
+
+    # 2. Logic Queue & ARP Request
+    if dst_ip not in arp_cache or dst_ip not in ip_to_location:
+        if dst_ip not in packet_queue:
+            packet_queue[dst_ip] = []
+            send_arp_request_smart(dst_ip)
+        packet_queue[dst_ip].append({'packet': packet, 'packet_in': packet_in, 'event': event})
+        return
+
+    # 3. Logic Forwarding (Routing)
+    dst_mac = arp_cache[dst_ip]
+    (dst_dpid, host_port) = ip_to_location[dst_ip]
+    src_gw = find_gateway_for_ip(dst_ip)
+    src_mac = router_interfaces[src_gw]
+    
+    out_port = None
+    if event.dpid == dst_dpid:
+        out_port = host_port # Last Hop
+    else:
+        out_port = get_next_hop_port(event.dpid, dst_dpid) # Next Hop (BFS)
+        if out_port is None: return # Drop to avoid loop
+
+    # Gửi Packet hiện tại
+    msg = of.ofp_packet_out()
+    msg.data = packet_in.data
+    msg.actions.append(of.ofp_action_dl_addr.set_src(src_mac))
+    msg.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
+    msg.actions.append(of.ofp_action_output(port=out_port))
+    event.connection.send(msg)
+    
+    # Yêu cầu 3: Cài đặt Flow (Gọi hàm từ mục 2)
+    install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
+
 
 # =============================================================================
 # 4. YÊU CẦU 4: FIREWALL (firewall.py)
 # =============================================================================
+
+def install_acl(connection, dpid):
+    sw_name = dpid_to_switch_name.get(dpid)
+    if not sw_name: return
+    acl_key = "ingress_" + sw_name
+    
+    for (rule_sw, proto, port, action, desc) in ACL:
+        if rule_sw == acl_key:
+            msg = of.ofp_flow_mod()
+            msg.priority = 100
+            msg.match.dl_type = ethernet.IP_TYPE
+            msg.match.nw_proto = IP_TCP_PROTOCOL if proto == "TCP" else IP_UDP_PROTOCOL
+            msg.match.tp_dst = port
+            
+            if action == "DENY": msg.actions = []
+            elif action == "ALLOW": msg.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
+            
+            connection.send(msg)
+            log.info("Firewall: %s on %s" % (desc, sw_name))
 
 
 # =============================================================================
