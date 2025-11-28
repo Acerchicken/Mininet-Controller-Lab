@@ -45,7 +45,7 @@ class MyTopo(Topo):
         self.addLink(s2, s3, port1=4, port2=3)
         
         # s3(4) <---> s1(4)
-        self.addLink(s3, s1, port1=4, port2=4)
+        #self.addLink(s3, s1, port1=4, port2=4)
 
 # Register topology with Mininet
 topos = { 'mytopo': ( lambda: MyTopo() ) }
