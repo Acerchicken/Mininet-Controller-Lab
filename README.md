@@ -21,8 +21,6 @@ This controller provides an end-to-end routing solution featuring:
 
 The network uses a stable triangle topology (s1-s2-s3-s1) to ensure redundancy, while the controller guarantees loop-free forwarding. 
 
-[Image of triangular network topology]
-
 
 | Subnet | Hosts | Gateway IP (Router MAC) | Switch DPID |
 | :--- | :--- | :--- | :--- |
@@ -53,7 +51,7 @@ python monitor.py
 ```
 
 **Terminal 2: Start the POX Controller**
-(Copy the prototype.py file into the /pox/pox/ext folder and go back to /pox/pox to run command)
+(Copy the All-in-one_Controller.py file into the /pox/pox/ext folder and go back to /pox/pox to run command)
 ```bash
 cd pox
 ./pox.py openflow.discovery controller.py
