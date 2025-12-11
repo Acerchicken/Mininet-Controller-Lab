@@ -20,35 +20,33 @@ log = core.getLogger()
 MONITOR_IP = "127.0.0.1"
 MONITOR_PORT = 6666
 
-# Protocols
+# --- TÙY CHỌN CÀI ĐẶT FLOW ---
+ENABLE_FLOW_INSTALL = True
+
 IP_TCP_PROTOCOL = ipv4.TCP_PROTOCOL
 IP_UDP_PROTOCOL = ipv4.UDP_PROTOCOL
 IP_ICMP_PROTOCOL = ipv4.ICMP_PROTOCOL
 ICMP_ECHO_REQUEST = 8
 ICMP_ECHO_REPLY = 0
 
-# Routing Table
 routing_table = [
     {'network': '10.0.1.0/24', 'gateway': '10.0.1.1'},
     {'network': '10.0.2.0/24', 'gateway': '10.0.2.1'},
     {'network': '10.0.3.0/24', 'gateway': '10.0.3.1'},
 ]
 
-# Router Interfaces (MACs changed to avoid conflict with Hosts)
 router_interfaces = {
     '10.0.1.1': EthAddr('00:00:00:00:01:01'),
     '10.0.2.1': EthAddr('00:00:00:00:02:01'),
     '10.0.3.1': EthAddr('00:00:00:00:03:01'),
 }
 
-# ACL Rules (Yêu cầu 4)
 ACL = [
   ("ingress_s1", "TCP", 22, "DENY", "Block SSH to s1"),
   ("ingress_s2", "TCP", 80, "DENY", "Block HTTP to s2"),
   ("ingress_s2", "UDP", 53, "ALLOW", "Allow DNS")
 ]
 
-# Switch Mappings
 switch_name_to_dpid = { "s1": 1, "s2": 2, "s3": 3 }
 dpid_to_switch_name = {v: k for k, v in switch_name_to_dpid.items()}
 
@@ -58,7 +56,6 @@ gateway_ip_to_dpid = {
     '10.0.3.1': 3
 }
 
-# GLOBAL STATE
 arp_cache = {}
 packet_queue = {}
 connections = {}
@@ -87,11 +84,10 @@ def is_switch_port(dpid, port):
     return False
 
 def learn_location(ip, dpid, port):
-    # Only learn from host ports, ignore inter-switch links
     if is_switch_port(dpid, port): return
     if ip not in ip_to_location or ip_to_location[ip] != (dpid, port):
         ip_to_location[ip] = (dpid, port)
-        log.debug("Learned: %s at s%s-eth%s" % (ip, dpid, port))
+        log.debug("Location Learned: Host %s is at s%s port %s" % (ip, dpid, port))
 
 def get_next_hop_port(src_dpid, dst_dpid):
     """BFS for Anti-Loop Routing"""
@@ -106,7 +102,10 @@ def get_next_hop_port(src_dpid, dst_dpid):
             if not path: return None
             next_node = path[0]
             if src_dpid in adjacency and next_node in adjacency[src_dpid]:
-                return adjacency[src_dpid][next_node]
+                port = adjacency[src_dpid][next_node]
+                # Log BFS Path Found
+                log.debug("BFS Path: s%s -> s%s (Next Hop Port: %s)" % (src_dpid, dst_dpid, port))
+                return port
             return None
         if node in adjacency:
             for neighbor in adjacency[node]:
@@ -118,13 +117,14 @@ def get_next_hop_port(src_dpid, dst_dpid):
 # 1. YÊU CẦU 1: ARP HANDLER (arp_handler.py)
 # =============================================================================
 
-
 def send_arp_request_smart(target_ip):
-    """Gửi ARP Request unicast đến switch đích (Tránh Flood)"""
     gw = find_gateway_for_ip(target_ip)
     if not gw: return
     target_dpid = gateway_ip_to_dpid.get(gw)
     if not target_dpid or target_dpid not in connections: return
+
+    # [Step 3 Log]
+    log.info("[Step 3] Smart ARP: Controller triggering Router on s%s to ask 'Who has %s?'" % (target_dpid, target_ip))
 
     src_mac = router_interfaces[gw]
     r = arp()
@@ -140,10 +140,8 @@ def send_arp_request_smart(target_ip):
     msg.data = e.pack()
     msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
     connections[target_dpid].send(msg)
-    log.info("Smart ARP: Router requesting %s on s%s" % (target_ip, target_dpid))
 
 def handle_arp_request(packet, packet_in, event):
-    """Xử lý ARP Request (Proxy ARP cho Gateway / Flood cho nội bộ)"""
     arp_packet = packet.payload
     target_ip = str(arp_packet.protodst)
     source_ip = str(arp_packet.protosrc)
@@ -153,6 +151,9 @@ def handle_arp_request(packet, packet_in, event):
     
     # CASE 1: ARP cho Gateway -> Router trả lời
     if target_ip in router_interfaces:
+        # [Step 1 Log: Receive Request]
+        log.info("[Step 1] ARP Request for Gateway: Host %s asking for %s on s%s" % (source_ip, target_ip, event.dpid))
+        
         reply_mac = router_interfaces[target_ip]
         arp_reply = arp()
         arp_reply.hwsrc = reply_mac
@@ -168,33 +169,38 @@ def handle_arp_request(packet, packet_in, event):
         msg.data = ether.pack()
         msg.actions.append(of.ofp_action_output(port=packet_in.in_port))
         event.connection.send(msg)
+        
+        # [Step 1 Log: Send Reply]
+        log.info("[Step 1] Controller replying: %s is at %s" % (target_ip, reply_mac))
         return
 
-    # CASE 2: ARP nội bộ (Host tìm Host) -> Flood trong subnet
+    # CASE 2: ARP nội bộ -> Flood
     gw = find_gateway_for_ip(target_ip)
     if not gw: return
     target_subnet_dpid = gateway_ip_to_dpid.get(gw)
     
-    # Chặn ARP lan sang subnet khác
     if event.dpid != target_subnet_dpid: return 
 
     msg = of.ofp_packet_out()
     msg.data = packet_in.data
     msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
     event.connection.send(msg)
+    log.debug("ARP: Flooded request for %s on s%s (Intra-subnet)" % (target_ip, event.dpid))
 
 def handle_arp_reply(packet, packet_in, event):
-    """Xử lý ARP Reply và Forward về host yêu cầu"""
     arp_packet = packet.payload
     src_ip = str(arp_packet.protosrc)
     dst_ip = str(arp_packet.protodst)
     
+    # [Step 4 Log]
+    log.info("[Step 4] Received ARP Reply on s%s: %s is at %s" % (event.dpid, src_ip, arp_packet.hwsrc))
+
     arp_cache[src_ip] = arp_packet.hwsrc
     learn_location(src_ip, event.dpid, packet_in.in_port)
-    log.info("ARP Learned: %s -> %s" % (src_ip, arp_packet.hwsrc))
     
     # Xử lý hàng đợi
     if src_ip in packet_queue:
+        log.info("[Step 4] Flushing %d queued packets for %s" % (len(packet_queue[src_ip]), src_ip))
         for item in packet_queue[src_ip]:
             handle_ip_packet(item['packet'], item['packet_in'], item['event'])
         del packet_queue[src_ip]
@@ -211,7 +217,6 @@ def handle_arp_reply(packet, packet_in, event):
             event.connection.send(msg)
             return
 
-    # Fallback flood nếu chưa biết vị trí
     msg = of.ofp_packet_out()
     msg.data = packet_in.data
     msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
@@ -223,26 +228,23 @@ def handle_arp_reply(packet, packet_in, event):
 # =============================================================================
 
 def install_route_flow(event, packet, src_ip, dst_ip, src_mac, dst_mac, out_port):
-    """
-    Cài đặt Flow L3 với Priority 50.
-    Match đầy đủ 5-tuple (Src IP, Dst IP, Proto) để hỗ trợ Monitor TX/RX.
-    """
     fm = of.ofp_flow_mod()
     fm.match.dl_type = ethernet.IP_TYPE
     
-    # Match IP Header
     fm.match.nw_src = IPAddr(src_ip) 
     fm.match.nw_dst = IPAddr(dst_ip)
-    fm.match.nw_proto = packet.protocol # TCP/UDP/ICMP
+    fm.match.nw_proto = packet.protocol
 
     fm.priority = 50
     fm.idle_timeout = 100
     
-    # Actions: Rewrite MAC & Output
     fm.actions.append(of.ofp_action_dl_addr.set_src(src_mac))
     fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
     fm.actions.append(of.ofp_action_output(port=out_port))
     
+    # [Step 5 Log: Install Flow]
+    log.info("[Step 5] Flow Installed on s%s for %s -> %s" % (event.dpid, src_ip, dst_ip))
+
     event.connection.send(fm)
 
 
@@ -271,11 +273,15 @@ def handle_ip_packet(packet, packet_in, event):
             event.connection.send(msg)
         return
 
-    # 2. Logic Queue & ARP Request
+    # [Step 2 Log: Buffering]
     if dst_ip not in arp_cache or dst_ip not in ip_to_location:
         if dst_ip not in packet_queue:
             packet_queue[dst_ip] = []
+            log.info("[Step 2] IP Packet %s -> %s buffered. Reason: Dest MAC unknown." % (src_ip, dst_ip))
             send_arp_request_smart(dst_ip)
+        else:
+            log.debug("Buffering another packet for %s" % dst_ip)
+        
         packet_queue[dst_ip].append({'packet': packet, 'packet_in': packet_in, 'event': event})
         return
 
@@ -290,7 +296,12 @@ def handle_ip_packet(packet, packet_in, event):
         out_port = host_port # Last Hop
     else:
         out_port = get_next_hop_port(event.dpid, dst_dpid) # Next Hop (BFS)
-        if out_port is None: return # Drop to avoid loop
+        if out_port is None: 
+            log.warning("Drop packet: No path from s%s to s%s" % (event.dpid, dst_dpid))
+            return
+
+    # [Step 5 Log: Routing Action]
+    log.info("[Step 5] Routing %s -> %s on s%s. Action: Rewrite MAC -> Output Port %s" % (src_ip, dst_ip, event.dpid, out_port))
 
     # Gửi Packet hiện tại
     msg = of.ofp_packet_out()
@@ -300,14 +311,16 @@ def handle_ip_packet(packet, packet_in, event):
     msg.actions.append(of.ofp_action_output(port=out_port))
     event.connection.send(msg)
     
-    # Yêu cầu 3: Cài đặt Flow (Gọi hàm từ mục 2)
-    install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
+    # Yêu cầu 3: Cài đặt Flow
+    if ENABLE_FLOW_INSTALL:
+        install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
+    else:
+        log.debug("Flow installation skipped (Control Plane Only)")
 
 
 # =============================================================================
 # 4. YÊU CẦU 4: FIREWALL (firewall.py)
 # =============================================================================
-
 def install_acl(connection, dpid):
     sw_name = dpid_to_switch_name.get(dpid)
     if not sw_name: return
@@ -316,16 +329,67 @@ def install_acl(connection, dpid):
     for (rule_sw, proto, port, action, desc) in ACL:
         if rule_sw == acl_key:
             msg = of.ofp_flow_mod()
-            msg.priority = 100
+            msg.priority = 100 # Priority cao nhất
             msg.match.dl_type = ethernet.IP_TYPE
             msg.match.nw_proto = IP_TCP_PROTOCOL if proto == "TCP" else IP_UDP_PROTOCOL
             msg.match.tp_dst = port
             
-            if action == "DENY": msg.actions = []
-            elif action == "ALLOW": msg.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
+            if action == "DENY":
+                # --- SỬA ĐỔI: Thay vì để rỗng, gửi lên Controller để Log ---
+                # max_len=128: Chỉ gửi 128 byte đầu (Header) để tiết kiệm băng thông
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER, max_len=128))
+            elif action == "ALLOW": 
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_CONTROLLER))
             
             connection.send(msg)
-            log.info("Firewall: %s on %s" % (desc, sw_name))
+            log.info("[Phase 1] Firewall Rule Installed on %s: %s (Action: Report & Drop)" % (sw_name, desc))
+
+def check_firewall_violation(packet, dpid):
+    """
+    Kiểm tra xem gói tin nhận được có vi phạm ACL không.
+    Nếu có -> Ghi Log Cảnh Báo -> Trả về True (để Drop).
+    """
+    # Chỉ check gói IP
+    ip_packet = packet.find('ipv4')
+    if not ip_packet: return False
+
+    # Lấy protocol (TCP/UDP)
+    proto_num = ip_packet.protocol
+    proto_str = ""
+    dst_port = 0
+
+    if proto_num == IP_TCP_PROTOCOL:
+        tcp_pkt = ip_packet.find('tcp')
+        if tcp_pkt: 
+            proto_str = "TCP"
+            dst_port = tcp_pkt.dstport
+    elif proto_num == IP_UDP_PROTOCOL:
+        udp_pkt = ip_packet.find('udp')
+        if udp_pkt:
+            proto_str = "UDP"
+            dst_port = udp_pkt.dstport
+    
+    # Không phải TCP/UDP thì bỏ qua
+    if proto_str == "": return False
+
+    # Kiểm tra đối chiếu với danh sách ACL
+    sw_name = dpid_to_switch_name.get(dpid)
+    acl_key = "ingress_" + sw_name
+    
+    for (rule_sw, rule_proto, rule_port, rule_action, desc) in ACL:
+        # Nếu khớp Rule, Khớp Protocol, Khớp Port VÀ Hành động là DENY
+        if (rule_sw == acl_key and 
+            rule_proto == proto_str and 
+            rule_port == dst_port and 
+            rule_action == "DENY"):
+            
+            # --- ĐÂY LÀ CHỖ GHI LOG BÁO CÁO ---
+            log.warning("!!! SECURITY ALERT !!! Switch s%s BLOCKED packet: %s -> %s (Port %s %s) | Rule: %s" % (
+                dpid, ip_packet.srcip, ip_packet.dstip, proto_str, dst_port, desc
+            ))
+            return True # Báo là ĐÃ VI PHẠM
+
+    return False # Không vi phạm
 
 
 # =============================================================================
@@ -337,7 +401,6 @@ def send_stats_request():
         connection.send(of.ofp_stats_request(body=of.ofp_flow_stats_request()))
 
 def handle_flow_stats(event):
-    """Xử lý thống kê và gửi qua UDP cho Dashboard"""
     dpid = event.connection.dpid
     host_stats = {}
 
@@ -352,7 +415,6 @@ def handle_flow_stats(event):
             if dst_ip not in router_interfaces:
                 if dst_ip not in host_stats: 
                     host_stats[dst_ip] = {'rx_total': 0, 'rx_tcp': 0, 'rx_udp': 0, 'rx_icmp': 0, 'tx_total': 0, 'tx_tcp': 0, 'tx_udp': 0, 'tx_icmp': 0}
-                
                 s = host_stats[dst_ip]
                 s['rx_total'] += bytes_count
                 if proto == 6: s['rx_tcp'] += bytes_count
@@ -365,7 +427,6 @@ def handle_flow_stats(event):
             if src_ip not in router_interfaces:
                 if src_ip not in host_stats:
                     host_stats[src_ip] = {'rx_total': 0, 'rx_tcp': 0, 'rx_udp': 0, 'rx_icmp': 0, 'tx_total': 0, 'tx_tcp': 0, 'tx_udp': 0, 'tx_icmp': 0}
-                
                 s = host_stats[src_ip]
                 s['tx_total'] += bytes_count
                 if proto == 6: s['tx_tcp'] += bytes_count
@@ -389,31 +450,51 @@ def handle_flow_stats(event):
 
 def _handle_ConnectionUp(event):
     connections[event.dpid] = event.connection
-    log.info("Switch s%s connected" % event.dpid)
+    # [Phase 1 Log: Connection]
+    log.info("[Phase 1] Switch s%s Connected" % event.dpid)
     install_acl(event.connection, event.dpid)
 
 def _handle_LinkEvent(event):
     l = event.link
     if l.dpid1 not in adjacency: adjacency[l.dpid1] = {}
     adjacency[l.dpid1][l.dpid2] = l.port1
-    log.info("Link Discovery: s%s -> s%s on port %s" % (l.dpid1, l.dpid2, l.port1))
+    # [Phase 2 Log: Discovery]
+    log.info("[Phase 2] Link Discovery: s%s -> s%s on port %s" % (l.dpid1, l.dpid2, l.port1))
 
 def _handle_PacketIn(event):
-    if not event.parsed: return
-    if event.parsed.type == ethernet.ARP_TYPE:
-        if event.parsed.payload.opcode == arp.REQUEST: handle_arp_request(event.parsed, event.ofp, event)
-        else: handle_arp_reply(event.parsed, event.ofp, event)
-    elif event.parsed.type == ethernet.IP_TYPE:
-        handle_ip_packet(event.parsed, event.ofp, event)
+    packet = event.parsed
+    if not packet: return
 
-def launch():
+    # Nếu check_firewall_violation trả về True -> Có nghĩa là gói tin bị cấm
+    if check_firewall_violation(packet, event.dpid):
+        return # Dừng ngay lập tức, không xử lý ARP hay Routing (DROP tại Controller)
+    # ---------------------------------------------
+
+    if packet.type == ethernet.ARP_TYPE:
+        if packet.payload.opcode == arp.REQUEST: handle_arp_request(packet, event.ofp, event)
+        else: handle_arp_reply(packet, event.ofp, event)
+    elif packet.type == ethernet.IP_TYPE:
+        handle_ip_packet(packet, event.ofp, event)
+
+def launch(install_flow=True):
+    # Cập nhật biến toàn cục dựa trên tham số dòng lệnh
+    global ENABLE_FLOW_INSTALL
+    if str(install_flow).lower() == "false":
+        ENABLE_FLOW_INSTALL = False
+    else:
+        ENABLE_FLOW_INSTALL = True
+    
+    if not ENABLE_FLOW_INSTALL:
+        log.warning("\n" + "!"*60)
+        log.warning(" WARNING: FLOW INSTALLATION DISABLED (CONTROL PLANE MODE)")
+        log.warning(" Performance will be slow. Use for testing/demo only.")
+        log.warning("!"*60 + "\n")
+
     def start_discovery(): core.openflow_discovery.addListeners(core)
     core.call_when_ready(start_discovery, "openflow_discovery")
     core.openflow_discovery.addListenerByName("LinkEvent", _handle_LinkEvent)
     core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
     core.openflow.addListenerByName("PacketIn", _handle_PacketIn)
-    
     core.openflow.addListenerByName("FlowStatsReceived", handle_flow_stats)
-    
     Timer(5, send_stats_request, recurring=True)
-    log.info("Triangle Router (RX/TX Monitor) Started")
+    log.info("Triangle Router (Verbose Logging) Started")
