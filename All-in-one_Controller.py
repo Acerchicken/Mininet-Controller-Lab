@@ -20,6 +20,9 @@ log = core.getLogger()
 MONITOR_IP = "127.0.0.1"
 MONITOR_PORT = 6666
 
+# --- TÙY CHỌN CÀI ĐẶT FLOW ---
+ENABLE_FLOW_INSTALL = True
+
 IP_TCP_PROTOCOL = ipv4.TCP_PROTOCOL
 IP_UDP_PROTOCOL = ipv4.UDP_PROTOCOL
 IP_ICMP_PROTOCOL = ipv4.ICMP_PROTOCOL
@@ -309,7 +312,10 @@ def handle_ip_packet(packet, packet_in, event):
     event.connection.send(msg)
     
     # Yêu cầu 3: Cài đặt Flow
-    install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
+    if ENABLE_FLOW_INSTALL:
+        install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
+    else:
+        log.debug("Flow installation skipped (Control Plane Only)")
 
 
 # =============================================================================
@@ -470,14 +476,25 @@ def _handle_PacketIn(event):
     elif packet.type == ethernet.IP_TYPE:
         handle_ip_packet(packet, event.ofp, event)
 
-def launch():
+def launch(install_flow=True):
+    # Cập nhật biến toàn cục dựa trên tham số dòng lệnh
+    global ENABLE_FLOW_INSTALL
+    if str(install_flow).lower() == "false":
+        ENABLE_FLOW_INSTALL = False
+    else:
+        ENABLE_FLOW_INSTALL = True
+    
+    if not ENABLE_FLOW_INSTALL:
+        log.warning("\n" + "!"*60)
+        log.warning(" WARNING: FLOW INSTALLATION DISABLED (CONTROL PLANE MODE)")
+        log.warning(" Performance will be slow. Use for testing/demo only.")
+        log.warning("!"*60 + "\n")
+
     def start_discovery(): core.openflow_discovery.addListeners(core)
     core.call_when_ready(start_discovery, "openflow_discovery")
     core.openflow_discovery.addListenerByName("LinkEvent", _handle_LinkEvent)
     core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
     core.openflow.addListenerByName("PacketIn", _handle_PacketIn)
-    
     core.openflow.addListenerByName("FlowStatsReceived", handle_flow_stats)
-    
     Timer(5, send_stats_request, recurring=True)
     log.info("Triangle Router (Verbose Logging) Started")
