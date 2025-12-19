@@ -253,57 +253,82 @@ def install_route_flow(event, packet, src_ip, dst_ip, src_mac, dst_mac, out_port
 # =============================================================================
 
 def handle_ip_packet(packet, packet_in, event):
-    ip_packet = packet.payload
-    if not isinstance(ip_packet, ipv4): return
+    ip_packet = packet.find('ipv4')
+    if not ip_packet: return
     
     src_ip = str(ip_packet.srcip)
     dst_ip = str(ip_packet.dstip)
     
     learn_location(src_ip, event.dpid, packet_in.in_port)
     
-    # 1. Ping Router Interface
+    # --- KHAI BÁO BIẾN ĐỂ DÙNG CHUNG CHO CẢ 2 TRƯỜNG HỢP (HOST & ROUTER) ---
+    dst_dpid = None
+    dst_mac = None
+
+    # === TRƯỜNG HỢP 1: ĐÍCH ĐẾN LÀ ROUTER INTERFACE (10.0.x.1) ===
     if dst_ip in router_interfaces:
-        if ip_packet.protocol == IP_ICMP_PROTOCOL and ip_packet.payload.type == ICMP_ECHO_REQUEST:
-            icmp_req = ip_packet.payload
-            icmp_rep = icmp(type=ICMP_ECHO_REPLY, code=0, payload=icmp_req.payload)
-            ip_rep = ipv4(protocol=IP_ICMP_PROTOCOL, srcip=ip_packet.dstip, dstip=ip_packet.srcip, payload=icmp_rep)
-            eth_rep = ethernet(type=ethernet.IP_TYPE, src=packet.dst, dst=packet.src, payload=ip_rep)
-            msg = of.ofp_packet_out(data=eth_rep.pack())
-            msg.actions.append(of.ofp_action_output(port=packet_in.in_port))
-            event.connection.send(msg)
-        return
-
-    # [Step 2 Log: Buffering]
-    if dst_ip not in arp_cache or dst_ip not in ip_to_location:
-        if dst_ip not in packet_queue:
-            packet_queue[dst_ip] = []
-            log.info("[Step 2] IP Packet %s -> %s buffered. Reason: Dest MAC unknown." % (src_ip, dst_ip))
-            send_arp_request_smart(dst_ip)
-        else:
-            log.debug("Buffering another packet for %s" % dst_ip)
+        target_dpid = gateway_ip_to_dpid.get(dst_ip)
         
-        packet_queue[dst_ip].append({'packet': packet, 'packet_in': packet_in, 'event': event})
-        return
+        # 1.1 Nếu là IP của chính Switch hiện tại -> Trả lời ICMP (Ping)
+        if target_dpid == event.dpid:
+            if ip_packet.protocol == IP_ICMP_PROTOCOL and ip_packet.payload.type == ICMP_ECHO_REQUEST:
+                icmp_req = ip_packet.payload
+                icmp_rep = icmp(type=ICMP_ECHO_REPLY, code=0, payload=icmp_req.payload)
+                ip_rep = ipv4(protocol=IP_ICMP_PROTOCOL, srcip=ip_packet.dstip, dstip=ip_packet.srcip, payload=icmp_rep)
+                eth_rep = ethernet(type=ethernet.IP_TYPE, src=packet.dst, dst=packet.src, payload=ip_rep)
+                msg = of.ofp_packet_out(data=eth_rep.pack())
+                msg.actions.append(of.ofp_action_output(port=packet_in.in_port))
+                event.connection.send(msg)
+            return
+        
+        # 1.2 Nếu là IP của Switch KHÁC (Remote Router) -> Định tuyến luôn không cần ARP!
+        # Đây là chỗ sửa lỗi kẹt gói tin:
+        dst_dpid = target_dpid
+        dst_mac = router_interfaces[dst_ip] # Biết chắc chắn MAC của router kia
+        log.info("Routing to Remote Router Interface: %s (s%s)" % (dst_ip, dst_dpid))
 
-    # 3. Logic Forwarding (Routing)
-    dst_mac = arp_cache[dst_ip]
-    (dst_dpid, host_port) = ip_to_location[dst_ip]
+    # === TRƯỜNG HỢP 2: ĐÍCH ĐẾN LÀ HOST BÌNH THƯỜNG ===
+    else:
+        # Logic ARP & Buffer cũ
+        if dst_ip not in arp_cache or dst_ip not in ip_to_location:
+            if dst_ip not in packet_queue:
+                packet_queue[dst_ip] = []
+                log.info("[Step 2] IP Packet %s -> %s buffered. Reason: Dest MAC unknown." % (src_ip, dst_ip))
+                send_arp_request_smart(dst_ip)
+            packet_queue[dst_ip].append({'packet': packet, 'packet_in': packet_in, 'event': event})
+            return
+        
+        dst_mac = arp_cache[dst_ip]
+        (dst_dpid, host_port) = ip_to_location[dst_ip]
+
+    # === PHẦN CHUNG: TÍNH TOÁN ĐƯỜNG ĐI & GỬI GÓI TIN ===
+    # (Lúc này đã có dst_dpid và dst_mac dù là Host hay Router)
+    
     src_gw = find_gateway_for_ip(dst_ip)
     src_mac = router_interfaces[src_gw]
     
     out_port = None
     if event.dpid == dst_dpid:
-        out_port = host_port # Last Hop
+        # Nếu đã đến switch đích
+        if dst_ip in router_interfaces:
+             # Gói tin đến đích là Router Interface (nhưng không phải ICMP Ping đã xử lý ở trên)
+             # Ví dụ: TCP 80 gửi tới 10.0.2.1. Tại đây ta cần chuyển lên Local Stack hoặc Drop.
+             # Tuy nhiên, trong bài lab này, switch đích nhận được packetIn sẽ chạy check_firewall_violation trước.
+             # Nếu vượt qua firewall, ta cho nó flood hoặc drop nhẹ nhàng để tránh loop.
+             return 
+        else:
+             # Đến Host
+             (dpid_check, out_port) = ip_to_location[dst_ip]
     else:
-        out_port = get_next_hop_port(event.dpid, dst_dpid) # Next Hop (BFS)
+        # Chưa đến switch đích -> Tìm Next Hop
+        out_port = get_next_hop_port(event.dpid, dst_dpid)
         if out_port is None: 
             log.warning("Drop packet: No path from s%s to s%s" % (event.dpid, dst_dpid))
             return
 
-    # [Step 5 Log: Routing Action]
-    log.info("[Step 5] Routing %s -> %s on s%s. Action: Rewrite MAC -> Output Port %s" % (src_ip, dst_ip, event.dpid, out_port))
+    log.info("[Step 5] Routing %s -> %s on s%s. Output Port %s" % (src_ip, dst_ip, event.dpid, out_port))
 
-    # Gửi Packet hiện tại
+    # Gửi Packet
     msg = of.ofp_packet_out()
     msg.data = packet_in.data
     msg.actions.append(of.ofp_action_dl_addr.set_src(src_mac))
@@ -311,7 +336,6 @@ def handle_ip_packet(packet, packet_in, event):
     msg.actions.append(of.ofp_action_output(port=out_port))
     event.connection.send(msg)
     
-    # Yêu cầu 3: Cài đặt Flow
     if ENABLE_FLOW_INSTALL:
         install_route_flow(event, ip_packet, src_ip, dst_ip, src_mac, dst_mac, out_port)
     else:
